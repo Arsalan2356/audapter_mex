@@ -502,6 +502,11 @@ private:
 
 		int bPvocAmpNorm;	/* Pitch vocoder amplitude normalization */		
 		int pvocAmpNormTrans; /* Length of the amplitude normalization factor transitional period */
+
+		bool vocode;
+		int vocode_channels;
+		int bpc;
+
 	} p;
 
 

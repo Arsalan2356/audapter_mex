@@ -35,12 +35,14 @@ Developed at:
 	Speech Laboratory, Boston University
 */
 
+#include <cmath>
 #include <fstream>
 #include <string>
 #include <sstream>
 #include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
+#include <vector>
 #include <windows.h>
 #include <process.h>
 #include <ctype.h>
@@ -136,6 +138,9 @@ Audapter::Audapter() :
 	params.addBoolParam("mute", "Global mute switch");
 	params.addBoolParam("bpvocmpnorm", "Phase vocoder amplitude normalization switch");
 
+	/* Vocode Bool Parameter */
+	params.addBoolParam("vocode", "Vocode switch");
+
 	/* Integer parameters */
 	params.addIntParam("srate", "Sampling rate (Hz), after downsampling");
 	params.addIntParam("framelen", "Frame length (samples), after downsampling");
@@ -154,6 +159,10 @@ Audapter::Audapter() :
 	params.addIntParam("tsgntones", "Tone sequence generator: number of tones");
 	params.addIntParam("downfact", "Downsampling factor");
 	params.addIntParam("stereomode", "Two-channel mode");
+
+	/* Vocode parameter */
+	params.addIntParam("vocode", "Number of vocoding channels (8, 16, 32)");
+
 
 	/* Integer array parameters */
 	params.addIntArrayParam("pvocampnormtrans", "Phase vocoder amplitude normalization transitional period length (frames)");
@@ -211,15 +220,7 @@ Audapter::Audapter() :
 	params.addDoubleArrayParam("tsgint", "Tone sequence generator: intervals between tone onsets (s)");
 
 	/* Other types of parameters */
-    params.addParam("rmsff_fb", "Speech-modulated noise feedback: RMS forgetting factor", Parameter::TYPE_SMN_RMS_FF);
-	params.addParam("pvocwarp",	 "Phase vocoder time warping configuration", Parameter::TYPE_PVOC_WARP);
-    params.addParam(
-        "timedomainpitchshiftschedule",
-        "Time-domain pitch shift schedule: Can take one of the following formats.\n"
-        "1. A single number: Applies a constant pitch shift.\n"
-        "2. An length-n*2 1D array, where n is the number of time points, of alternating time \n"
-        "  points and pitch-shift ratios."
-        "  The time points (in seconds) are required to be monotonically increasing.\n"
+    params.addParam("rmsffx_out (in seconds) are required to be monotonically increasing.\n"
         "  The first element is required to be 0.\n"
         "  The time points are anchor points. The amount\n"
         "  of pitch shift between the anchor points are interpolated linearly. For time periods\n"
@@ -1091,6 +1092,16 @@ void *Audapter::setGetParam(bool bSet,
 	else if (ns == string("fb2gain")) {
 		ptr = (void *)&p.fb2Gain;
 	}
+	else if (ns == string("vocode")) {
+		ptr = (void *)&p.vocode;
+	}
+	else if (ns == string("vocode_channels")) {
+		ptr = (void *)&p.vocode_channels;
+	}
+	else if (ns == string("bpcorder")) {
+		ptr = (void *)&p.bpc;
+	}
+
 	else {		
 		string errStr("Unknown parameter name: ");
 		errStr += string(name);
@@ -1765,6 +1776,101 @@ int Audapter::handleBuffer(dtype *inFrame_ptr, dtype *outFrame_ptr, int frame_si
 		offs += 1;
 		data_recorder[offs][data_counter] = stat;
 	}
+
+
+	if (p.vocode) {
+		
+		// Calculate corners
+		
+		// Constant to multiply by to evenly divide the pitch space 
+		// into logarithmically equivalent segments
+		int mult_const = pow((p.pitchUpperBoundHz - p.pitchLowerBoundHz), 1 / (p.vocode_channels));
+		
+		vector<float> cf;
+		
+		vector<float> bw;
+		
+		vector<float> log_space;
+		
+		float val = pow(10, p.pitchLowerBoundHz);
+		
+		while (log_space.size() < (p.vocode_channels + 1)) {
+			val *= mult_const;
+			log_space.push_back(val);
+		}
+
+		for (int i = 0; i < N) {
+			cf.push_back(sqrt(log_space[i] * log_space[i + 1]));
+			bw.push_back(log_space[i + 1] - log_space[i]);
+		}
+
+		int n = frame_size;
+		int lpe_cutoff = 400;
+
+
+		vector<float> t;
+		for (int i = 0; i < n) {
+			t.push_back(i / p.sr);
+		}
+
+		vector<float> ana_corners(log_space);
+		vector<float> syn_corners(log_space);
+		int gauss_rate = 100;
+		float pi = 3.1415;
+
+		float d = 0.5 * p.sr;
+
+		// Filter
+
+		float a_const = a[1];
+		vector<float> y;
+		for (int i = 0; i < n; i++) {
+			float sum = 0;
+			for (int j = 0; j <= i; j++) {
+				sum += b[j] * x[i - j];
+			}
+		}
+
+		(b, a) = butter_high(1, 1200/d);
+
+		x = filter(b, a, x);
+
+		vector<float> x_channels;
+		vector<float> x_env;
+		vector<float> ana_corners_scaled(ana_corners);
+		for (int i = 0; i < ana_corners_scaled.size()) {
+			ana_corners_scaled[i] /= d;
+		}
+
+		for (int i = 0; i < p.vocode_channels) {
+			(b, a) = butter_bandpass(p.bpc, [ana_corners_scaled[i], ana_corners_scaled[i + 1]]);
+			x_channels.push_back(filter(b, a, x));
+
+			x_channels[i] = rectify(x_channels[i]);
+
+			(b, a) = butter_low(2, lpe_cutoff);
+			x_env.push_back(filter(b, a, x_channels[i]));
+		}
+
+		vector<float> x_out;
+		for (int i = 0; i < n; i++) {
+			x_out.push_back(0);
+		}
+
+		for (int i = 0; i < p.vocode_channels) {
+			cf[i] = (syn_corners[i] + syn_corners[i + 1]) / 2;
+			x_out.push_back(x_out + sin(2 * pi * cf[i] * t) * x_env[i]);
+		}
+		
+		for (int i = 0; i < n; i++) {
+			outputBuf[i] = x_out[i];
+		}
+
+
+	}
+
+
+
 	
 	// gain adaption: optional
 	//SC Notice that gain adaptation is done after formant shifts
